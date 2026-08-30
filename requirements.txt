@@ -1,0 +1,6 @@
+requests>=2.32,<3
+pandas>=2.2,<3
+pyarrow>=18,<30
+openpyxl>=3.1,<4
+xlrd>=2.0,<3
+urllib3>=2.2,<3
