@@ -32,7 +32,7 @@ from urllib3.util.retry import Retry
 # INSS 2025+ -> Parquet -> SharePoint -> Power BI
 # ============================================================
 
-APP_VERSION = "5.2.0"
+APP_VERSION = "5.3.0"
 
 CKAN_BASE = "https://dadosabertos.inss.gov.br"
 CKAN_ORG = "instituto-nacional-de-seguro-social-inss"
@@ -576,7 +576,7 @@ def _csv_factory_to_parquet(
     label: str,
 ) -> int:
     """Converte sem descartar linhas; falha se a estrutura continuar inconsistente."""
-    attempts = [
+    standard_attempts = [
         {
             "name": "csv_padrao",
             "quoting": csv.QUOTE_MINIMAL,
@@ -593,6 +593,14 @@ def _csv_factory_to_parquet(
             "quoting": csv.QUOTE_NONE,
         },
     ]
+
+    # Os arquivos Mantidos de jul/2026 publicados pelo INSS possuem aspas
+    # inconsistentes. Para eles, tratar aspas como texto literal evita uma
+    # leitura completa de dezenas de GB antes de cair no fallback.
+    if "mantidos" in norm(label):
+        attempts = [standard_attempts[2], standard_attempts[0], standard_attempts[1]]
+    else:
+        attempts = standard_attempts
 
     last_error: Exception | None = None
 
@@ -642,11 +650,11 @@ def _csv_factory_to_parquet(
             )
             return rows
 
-        except pd.errors.ParserError as exc:
+        except (pd.errors.ParserError, csv.Error, UnicodeDecodeError) as exc:
             last_error = exc
             print(
                 f"AVISO | parser {attempt_number}/{len(attempts)} falhou "
-                f"em {label}: {exc}"
+                f"em {label}: {type(exc).__name__}: {exc}"
             )
         finally:
             if writer is not None:
@@ -1185,6 +1193,33 @@ def save_control(graph: Graph, category: str, control: dict[str, Any]) -> None:
     )
 
 
+def record_blocked_source(
+    graph: Graph,
+    control: dict[str, Any],
+    category: str,
+    resource: dict[str, Any],
+    error: Exception,
+) -> None:
+    rid = str(resource.get("id") or resource.get("url") or safe_name(resource.get("name")))
+    blocked = control.setdefault("blocked_sources", {})
+    previous = blocked.get(rid) if isinstance(blocked, dict) else None
+    if not isinstance(blocked, dict):
+        blocked = {}
+        control["blocked_sources"] = blocked
+    attempts = int((previous or {}).get("attempts") or 0) + 1
+    blocked[rid] = {
+        "status": "source_unavailable",
+        "category": category,
+        "resource_name": resource.get("name"),
+        "resource_url": resource.get("url"),
+        "version": resource_version(resource),
+        "attempts": attempts,
+        "last_seen_utc": now_iso(),
+        "error": str(error)[:2000],
+    }
+    save_control(graph, category, control)
+
+
 def needs_processing(
     control: dict[str, Any],
     resource: dict[str, Any],
@@ -1254,6 +1289,9 @@ def process_one(
             "processed_at_utc": now_iso(),
             "outputs": remote_outputs,
         }
+        blocked = control.get("blocked_sources")
+        if isinstance(blocked, dict):
+            blocked.pop(rid, None)
         save_control(graph, category, control)
         print("CHECKPOINT OK")
 
@@ -1348,11 +1386,18 @@ def main() -> int:
 
             except SourceUnavailable as e:
                 blocked_sources += 1
+                record_blocked_source(
+                    graph, control, category, resource, e
+                )
                 print(
                     f"BLOQUEIO NA FONTE OFICIAL | {category} | "
                     f"{resource.get('name')}"
                 )
                 print(str(e))
+                print(
+                    f"::warning title=Fonte oficial indisponivel::{category} | "
+                    f"{resource.get('name')} sera tentado novamente na proxima execucao."
+                )
                 print(
                     "Continuando para o proximo recurso sem marcar "
                     "este como concluido."
@@ -1373,9 +1418,10 @@ def main() -> int:
     print(f"FONTES OFICIAIS BLOQUEADAS: {blocked_sources}")
     print("=" * 80)
 
-    # A carga so fica verde quando estiver completa.
-    # Mesmo com fonte externa bloqueada, as competencias anteriores continuam.
-    return 1 if (errors or blocked_sources) else 0
+    # Erro de processamento deixa o job vermelho.
+    # Fonte oficial temporariamente bloqueada vira WARNING auditavel e sera
+    # retentada nas proximas execucoes, sem derrubar toda a carga disponivel.
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
