@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import io
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse, urlsplit, urlunsplit
 
 import pandas as pd
 import pyarrow as pa
@@ -31,7 +32,7 @@ from urllib3.util.retry import Retry
 # INSS 2025+ -> Parquet -> SharePoint -> Power BI
 # ============================================================
 
-APP_VERSION = "5.1.0"
+APP_VERSION = "5.2.0"
 
 CKAN_BASE = "https://dadosabertos.inss.gov.br"
 CKAN_ORG = "instituto-nacional-de-seguro-social-inss"
@@ -61,6 +62,11 @@ RULES = {
     "unidades": "perfil das unidades",
     "folha_emitidos": "dados agregados da folha de pagamento em relacao aos beneficios emitidos",
 }
+
+
+class SourceUnavailable(RuntimeError):
+    """Fonte oficial temporariamente inacessivel (ex.: 403/404)."""
+
 
 
 def norm(value: Any) -> str:
@@ -433,16 +439,8 @@ class Graph:
                 start = end + 1
 
 
-def detect_csv(path: Path) -> tuple[str, str, int]:
-    """Detecta encoding, delimitador e linha real do cabecalho.
-
-    Alguns arquivos oficiais trazem linhas informativas antes da tabela.
-    A deteccao usa consistencia de quantidade de campos para evitar que
-    pandas interprete essas linhas como cabecalho.
-    """
-    with path.open("rb") as f:
-        sample = f.read(512_000)
-
+def detect_csv_bytes(sample: bytes) -> tuple[str, str, int]:
+    """Detecta encoding, delimitador e linha real do cabecalho."""
     encoding = "utf-8"
     for enc in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
         try:
@@ -455,7 +453,6 @@ def detect_csv(path: Path) -> tuple[str, str, int]:
     text = sample.decode(encoding)
     lines = text.splitlines()
 
-    # CSVs gerados para Excel podem trazer "sep=;" na primeira linha.
     for idx, line in enumerate(lines[:10]):
         stripped = line.strip()
         if not stripped:
@@ -467,45 +464,69 @@ def detect_csv(path: Path) -> tuple[str, str, int]:
 
     def width(line: str, delimiter: str) -> int:
         try:
-            return len(next(csv.reader([line], delimiter=delimiter, quotechar='"')))
+            return len(
+                next(
+                    csv.reader(
+                        [line],
+                        delimiter=delimiter,
+                        quotechar='"',
+                        strict=False,
+                    )
+                )
+            )
         except (csv.Error, StopIteration):
             return 0
 
     candidates = [";", ",", "\t", "|", "^"]
     useful = [
-        line for line in lines[:100]
+        line for line in lines[:120]
         if line.strip() and not line.lstrip().startswith(("#", "//"))
     ]
 
     best = None
     for delimiter in candidates:
-        widths = [width(line, delimiter) for line in useful[:60]]
+        widths = [width(line, delimiter) for line in useful[:80]]
         widths = [w for w in widths if w > 1]
         if not widths:
             continue
-        counts = {}
+
+        counts: dict[int, int] = {}
         for w in widths:
             counts[w] = counts.get(w, 0) + 1
-        mode_width, mode_count = max(counts.items(), key=lambda x: (x[1], x[0]))
+
+        mode_width, mode_count = max(
+            counts.items(),
+            key=lambda x: (x[1], x[0]),
+        )
         consistency = mode_count / len(widths)
-        score = (consistency, mode_width, mode_count)
+        score = (consistency, mode_count, mode_width)
+
         if best is None or score > best[0]:
             best = (score, delimiter, mode_width)
 
     if best is None:
-        raise RuntimeError(f"Nao foi possivel detectar delimitador: {path.name}")
+        raise RuntimeError("Nao foi possivel detectar o delimitador do CSV.")
 
     _, delimiter, dominant_width = best
+
     header_index = 0
-    for i, line in enumerate(lines[:40]):
+    for i, line in enumerate(lines[:50]):
         if not line.strip():
             continue
         if width(line, delimiter) != dominant_width:
             continue
         try:
-            fields = next(csv.reader([line], delimiter=delimiter, quotechar='"'))
+            fields = next(
+                csv.reader(
+                    [line],
+                    delimiter=delimiter,
+                    quotechar='"',
+                    strict=False,
+                )
+            )
         except csv.Error:
             continue
+
         nonempty = sum(bool(str(v).strip()) for v in fields)
         if nonempty >= max(2, dominant_width // 2):
             header_index = i
@@ -513,12 +534,19 @@ def detect_csv(path: Path) -> tuple[str, str, int]:
 
     return encoding, delimiter, header_index
 
+
+def detect_csv(path: Path) -> tuple[str, str, int]:
+    with path.open("rb") as f:
+        sample = f.read(512_000)
+    return detect_csv_bytes(sample)
+
+
 def unique_columns(columns: list[Any]) -> list[str]:
     used: dict[str, int] = {}
     result: list[str] = []
 
     for i, c in enumerate(columns, start=1):
-        base = str(c).strip() if c is not None else ""
+        base = str(c).strip().lstrip("\ufeff") if c is not None else ""
         base = base or f"coluna_{i}"
         used[base] = used.get(base, 0) + 1
         result.append(base if used[base] == 1 else f"{base}__{used[base]}")
@@ -538,43 +566,141 @@ def chunk_to_table(df: pd.DataFrame) -> pa.Table:
     return pa.table(arrays)
 
 
+def _csv_factory_to_parquet(
+    factory,
+    target: Path,
+    *,
+    encoding: str,
+    delimiter: str,
+    header_index: int,
+    label: str,
+) -> int:
+    """Converte sem descartar linhas; falha se a estrutura continuar inconsistente."""
+    attempts = [
+        {
+            "name": "csv_padrao",
+            "quoting": csv.QUOTE_MINIMAL,
+            "doublequote": True,
+        },
+        {
+            "name": "aspas_com_escape",
+            "quoting": csv.QUOTE_MINIMAL,
+            "doublequote": False,
+            "escapechar": "\\",
+        },
+        {
+            "name": "aspas_literais",
+            "quoting": csv.QUOTE_NONE,
+        },
+    ]
+
+    last_error: Exception | None = None
+
+    for attempt_number, options in enumerate(attempts, start=1):
+        target.unlink(missing_ok=True)
+        writer: pq.ParquetWriter | None = None
+        rows = 0
+
+        try:
+            with factory() as handle:
+                reader = pd.read_csv(
+                    handle,
+                    sep=delimiter,
+                    encoding=encoding,
+                    skiprows=header_index,
+                    engine="python",
+                    dtype=str,
+                    chunksize=CSV_CHUNK_ROWS,
+                    keep_default_na=False,
+                    na_filter=False,
+                    on_bad_lines="error",
+                    quoting=options["quoting"],
+                    doublequote=options.get("doublequote", True),
+                    escapechar=options.get("escapechar"),
+                )
+
+                for chunk in reader:
+                    table = chunk_to_table(chunk)
+                    if writer is None:
+                        writer = pq.ParquetWriter(
+                            target,
+                            table.schema,
+                            compression="zstd",
+                            use_dictionary=True,
+                        )
+                    writer.write_table(table)
+                    rows += len(chunk)
+
+            if writer is None:
+                raise RuntimeError(f"CSV sem dados: {label}")
+
+            writer.close()
+            writer = None
+            print(
+                f"CSV OK | {label} | modo={options['name']} | "
+                f"{rows:,} linhas"
+            )
+            return rows
+
+        except pd.errors.ParserError as exc:
+            last_error = exc
+            print(
+                f"AVISO | parser {attempt_number}/{len(attempts)} falhou "
+                f"em {label}: {exc}"
+            )
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+        target.unlink(missing_ok=True)
+
+    raise RuntimeError(
+        f"CSV oficial continua inconsistente apos {len(attempts)} "
+        f"estrategias: {label}. Ultimo erro: {last_error}"
+    )
+
+
 def csv_to_parquet(source: Path, target: Path) -> int:
     encoding, delimiter, header_index = detect_csv(source)
-    writer: pq.ParquetWriter | None = None
-    rows = 0
+    print(
+        f"CSV detectado | encoding={encoding} | "
+        f"delimitador={delimiter!r} | cabecalho={header_index + 1}"
+    )
+    return _csv_factory_to_parquet(
+        lambda: source.open("rb"),
+        target,
+        encoding=encoding,
+        delimiter=delimiter,
+        header_index=header_index,
+        label=source.name,
+    )
 
-    try:
-        reader = pd.read_csv(
-            source,
-            sep=delimiter,
-            encoding=encoding,
-            skiprows=header_index,
-            engine="python",
-            dtype=str,
-            chunksize=CSV_CHUNK_ROWS,
-            keep_default_na=False,
-            na_filter=False,
-            on_bad_lines="error",
-        )
 
-        for chunk in reader:
-            table = chunk_to_table(chunk)
-            if writer is None:
-                writer = pq.ParquetWriter(
-                    target,
-                    table.schema,
-                    compression="zstd",
-                    use_dictionary=True,
-                )
-            writer.write_table(table)
-            rows += len(chunk)
-    finally:
-        if writer:
-            writer.close()
+def zip_csv_to_parquet(
+    archive: zipfile.ZipFile,
+    member: str,
+    target: Path,
+) -> int:
+    with archive.open(member) as handle:
+        sample = handle.read(512_000)
 
-    if writer is None:
-        raise RuntimeError(f"CSV sem dados: {source.name}")
-    return rows
+    encoding, delimiter, header_index = detect_csv_bytes(sample)
+    print(
+        f"ZIP/CSV detectado | {member} | encoding={encoding} | "
+        f"delimitador={delimiter!r} | cabecalho={header_index + 1}"
+    )
+
+    return _csv_factory_to_parquet(
+        lambda: archive.open(member),
+        target,
+        encoding=encoding,
+        delimiter=delimiter,
+        header_index=header_index,
+        label=member,
+    )
 
 
 def xlsx_to_parquet(source: Path, output_dir: Path, prefix: str) -> list[tuple[Path, int]]:
@@ -696,48 +822,216 @@ def detect_file_kind(path: Path) -> str:
     return "csv"
 
 
+def _download_url_variants(url: str) -> list[str]:
+    """Tenta tambem a variante em que '+' publicado no caminho representa espaco."""
+    variants = [url]
+    parsed = urlsplit(url)
+    decoded_path = unquote(parsed.path)
+
+    if "+" in decoded_path:
+        alternate_path = quote(decoded_path.replace("+", " "), safe="/")
+        alternate = urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                alternate_path,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+        if alternate not in variants:
+            variants.append(alternate)
+
+    return variants
+
+
+def _download_via_datastore(
+    resource: dict[str, Any],
+    folder: Path,
+) -> tuple[Path, str, str] | None:
+    """Fallback CKAN DataStore quando o arquivo externo estiver indisponivel."""
+    rid = str(resource.get("id") or "")
+    if not rid:
+        return None
+
+    endpoint = f"{CKAN_BASE}/api/3/action/datastore_search"
+
+    try:
+        probe = HTTP.get(
+            endpoint,
+            params={"resource_id": rid, "limit": 1, "offset": 0},
+            timeout=(30, 180),
+        )
+        if probe.status_code != 200:
+            return None
+
+        payload = probe.json()
+        if not payload.get("success"):
+            return None
+
+        result = payload.get("result") or {}
+        fields = [
+            str(f.get("id"))
+            for f in (result.get("fields") or [])
+            if str(f.get("id") or "") != "_id"
+        ]
+        if not fields:
+            return None
+
+        total = int(result.get("total") or 0)
+        target = folder / "origem_datastore.csv"
+
+        print(
+            f"Fallback CKAN DataStore ativo | recurso={rid} | "
+            f"registros={total:,}"
+        )
+
+        page_size = 10_000
+        offset = 0
+
+        with target.open("w", encoding="utf-8", newline="") as out:
+            writer = csv.DictWriter(
+                out,
+                fieldnames=fields,
+                delimiter=";",
+                quoting=csv.QUOTE_MINIMAL,
+                extrasaction="ignore",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+
+            while offset < total:
+                response = HTTP.get(
+                    endpoint,
+                    params={
+                        "resource_id": rid,
+                        "limit": page_size,
+                        "offset": offset,
+                    },
+                    timeout=(30, 300),
+                )
+                response.raise_for_status()
+                page = response.json()
+                if not page.get("success"):
+                    raise RuntimeError(
+                        f"CKAN DataStore success=false no offset {offset}"
+                    )
+
+                records = (page.get("result") or {}).get("records") or []
+                if not records:
+                    break
+
+                for record in records:
+                    clean = {}
+                    for field in fields:
+                        value = record.get(field)
+                        if value is None:
+                            clean[field] = ""
+                        elif isinstance(value, (dict, list)):
+                            clean[field] = json.dumps(
+                                value,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        else:
+                            clean[field] = str(value)
+                    writer.writerow(clean)
+
+                offset += len(records)
+                print(
+                    f"DataStore | {min(offset, total):,}/{total:,} registros"
+                )
+
+        digest = hashlib.sha256()
+        with target.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(DOWNLOAD_CHUNK), b""):
+                digest.update(chunk)
+
+        return target, digest.hexdigest(), "csv"
+
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        print(f"DataStore indisponivel para {rid}: {exc}")
+        return None
+
+
 def download_resource(resource: dict[str, Any], folder: Path) -> tuple[Path, str, str]:
     url = str(resource.get("url") or "")
     if not url:
         raise RuntimeError("Recurso sem URL.")
 
-    raw = folder / "origem.bin"
-    digest = hashlib.sha256()
+    statuses: list[str] = []
 
-    with HTTP.get(
-        url,
-        stream=True,
-        headers={"Referer": f"{CKAN_BASE}/", "Accept": "*/*"},
-        timeout=(30, 600),
-        allow_redirects=True,
-    ) as r:
-        r.raise_for_status()
-        content_type = str(r.headers.get("Content-Type") or "")
-        with raw.open("wb") as f:
-            for chunk in r.iter_content(DOWNLOAD_CHUNK):
-                if chunk:
-                    f.write(chunk)
-                    digest.update(chunk)
+    for candidate_url in _download_url_variants(url):
+        raw = folder / "origem.bin"
+        raw.unlink(missing_ok=True)
+        digest = hashlib.sha256()
 
-    if raw.stat().st_size == 0:
-        raise RuntimeError("Download resultou em arquivo vazio.")
+        try:
+            with HTTP.get(
+                candidate_url,
+                stream=True,
+                headers={
+                    "Referer": f"{CKAN_BASE}/",
+                    "Accept": "*/*",
+                },
+                timeout=(30, 600),
+                allow_redirects=True,
+            ) as r:
+                if r.status_code in (403, 404):
+                    statuses.append(f"{r.status_code} {candidate_url}")
+                    print(
+                        f"Fonte externa respondeu HTTP {r.status_code}; "
+                        "tentando fallback..."
+                    )
+                    continue
 
-    kind = detect_file_kind(raw)
-    if kind == "html":
-        raise RuntimeError(
-            f"Portal devolveu HTML em vez da base. Content-Type={content_type!r}"
-        )
+                r.raise_for_status()
+                content_type = str(r.headers.get("Content-Type") or "")
 
-    suffix = {
-        "zip": ".zip",
-        "gzip": ".gz",
-        "xlsx": ".xlsx",
-        "xls": ".xls",
-        "csv": ".csv",
-    }[kind]
-    target = folder / f"origem{suffix}"
-    raw.replace(target)
-    return target, digest.hexdigest(), kind
+                with raw.open("wb") as f:
+                    for chunk in r.iter_content(DOWNLOAD_CHUNK):
+                        if chunk:
+                            f.write(chunk)
+                            digest.update(chunk)
+
+            if raw.stat().st_size == 0:
+                statuses.append(f"arquivo vazio {candidate_url}")
+                continue
+
+            kind = detect_file_kind(raw)
+            if kind == "html":
+                statuses.append(
+                    f"HTML em vez de dados {candidate_url} "
+                    f"Content-Type={content_type!r}"
+                )
+                raw.unlink(missing_ok=True)
+                continue
+
+            suffix = {
+                "zip": ".zip",
+                "gzip": ".gz",
+                "xlsx": ".xlsx",
+                "xls": ".xls",
+                "csv": ".csv",
+            }[kind]
+            target = folder / f"origem{suffix}"
+            target.unlink(missing_ok=True)
+            raw.replace(target)
+            return target, digest.hexdigest(), kind
+
+        except requests.RequestException as exc:
+            statuses.append(f"{type(exc).__name__}: {exc}")
+            raw.unlink(missing_ok=True)
+
+    datastore = _download_via_datastore(resource, folder)
+    if datastore is not None:
+        return datastore
+
+    raise SourceUnavailable(
+        "Fonte oficial indisponivel e sem fallback DataStore. "
+        + " | ".join(statuses[-3:])
+    )
+
 
 def convert_resource(
     source: Path,
@@ -802,37 +1096,67 @@ def convert_resource(
 
         for i, member in enumerate(chosen, start=1):
             declared_ext = Path(member).suffix.lower()
+            inner_prefix = f"{prefix}__{safe_name(Path(member).stem)}"
+
+            # CSV/TXT grande e lido diretamente do ZIP.
+            if declared_ext in {".csv", ".txt"}:
+                info = z.getinfo(member)
+                print(
+                    f"ZIP/CSV streaming | {member} | "
+                    f"{info.file_size / 1024 / 1024:,.1f} MB descompactado"
+                )
+                target = out / f"{inner_prefix}.parquet"
+                outputs.append(
+                    (target, zip_csv_to_parquet(z, member, target))
+                )
+                continue
+
             extracted_raw = folder / f"zip_{i}.bin"
             with z.open(member) as src_zip, extracted_raw.open("wb") as dst:
                 shutil.copyfileobj(src_zip, dst, length=DOWNLOAD_CHUNK)
 
             inner_kind = detect_file_kind(extracted_raw)
             actual_ext = {
-                "csv": ".csv",
                 "xlsx": ".xlsx",
                 "xls": ".xls",
                 "zip": ".zip",
+                "csv": ".csv",
             }.get(inner_kind, declared_ext)
             extracted = folder / f"zip_{i}{actual_ext}"
             extracted_raw.replace(extracted)
 
-            inner_prefix = f"{prefix}__{safe_name(Path(member).stem)}"
-
-            if inner_kind == "csv":
-                target = out / f"{inner_prefix}.parquet"
-                outputs.append((target, csv_to_parquet(extracted, target)))
-            elif inner_kind == "xlsx":
-                outputs.extend(xlsx_to_parquet(extracted, out, inner_prefix))
-            elif inner_kind == "xls":
-                outputs.extend(xls_to_parquet(extracted, out, inner_prefix))
-            elif inner_kind == "zip":
-                nested_resource = dict(resource)
-                nested_resource["name"] = f"{resource.get('name')} - {Path(member).stem}"
-                outputs.extend(convert_resource(extracted, nested_resource, folder))
-            else:
-                raise RuntimeError(f"Formato interno nao suportado: {inner_kind}")
-
-            extracted.unlink(missing_ok=True)
+            try:
+                if inner_kind == "xlsx":
+                    outputs.extend(
+                        xlsx_to_parquet(extracted, out, inner_prefix)
+                    )
+                elif inner_kind == "xls":
+                    outputs.extend(
+                        xls_to_parquet(extracted, out, inner_prefix)
+                    )
+                elif inner_kind == "csv":
+                    target = out / f"{inner_prefix}.parquet"
+                    outputs.append(
+                        (target, csv_to_parquet(extracted, target))
+                    )
+                elif inner_kind == "zip":
+                    nested_resource = dict(resource)
+                    nested_resource["name"] = (
+                        f"{resource.get('name')} - {Path(member).stem}"
+                    )
+                    outputs.extend(
+                        convert_resource(
+                            extracted,
+                            nested_resource,
+                            folder,
+                        )
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Formato interno nao suportado: {inner_kind}"
+                    )
+            finally:
+                extracted.unlink(missing_ok=True)
 
         return outputs
 
@@ -982,6 +1306,7 @@ def main() -> int:
 
     ok = 0
     errors = 0
+    blocked_sources = 0
 
     for category, dataset in selected.items():
         control = load_control(graph, category)
@@ -990,29 +1315,67 @@ def main() -> int:
             if needs_processing(control, r, args.force)
         ]
 
-        if args.max_resources > 0:
-            pending = pending[: args.max_resources]
+        target_successes = (
+            len(pending)
+            if args.max_resources <= 0
+            else min(args.max_resources, len(pending))
+        )
 
-        print(f"\n[{category}] pendentes nesta execucao: {len(pending)}")
+        print(
+            f"\n[{category}] pendentes totais: {len(pending)} | "
+            f"meta de sucessos nesta execucao: {target_successes}"
+        )
+
+        successes_in_category = 0
 
         for resource in pending:
+            if (
+                args.max_resources > 0
+                and successes_in_category >= args.max_resources
+            ):
+                break
+
             try:
-                process_one(graph, control, category, dataset, resource)
+                process_one(
+                    graph,
+                    control,
+                    category,
+                    dataset,
+                    resource,
+                )
                 ok += 1
+                successes_in_category += 1
+
+            except SourceUnavailable as e:
+                blocked_sources += 1
+                print(
+                    f"BLOQUEIO NA FONTE OFICIAL | {category} | "
+                    f"{resource.get('name')}"
+                )
+                print(str(e))
+                print(
+                    "Continuando para o proximo recurso sem marcar "
+                    "este como concluido."
+                )
+
             except Exception as e:
                 errors += 1
                 print(f"ERRO | {category} | {resource.get('name')}")
                 print(str(e))
-                print("Nao foi marcado como concluido; sera tentado novamente.")
+                print(
+                    "Nao foi marcado como concluido; "
+                    "sera tentado novamente."
+                )
 
     print("\n" + "=" * 80)
     print(f"SUCESSO: {ok}")
-    print(f"ERROS: {errors}")
+    print(f"ERROS DE PROCESSAMENTO: {errors}")
+    print(f"FONTES OFICIAIS BLOQUEADAS: {blocked_sources}")
     print("=" * 80)
 
-    # Erros parciais nao apagam nem invalidam o que ja foi concluido.
-    # A proxima execucao retenta somente os recursos ainda nao checkpointados.
-    return 1 if errors else 0
+    # A carga so fica verde quando estiver completa.
+    # Mesmo com fonte externa bloqueada, as competencias anteriores continuam.
+    return 1 if (errors or blocked_sources) else 0
 
 
 if __name__ == "__main__":
