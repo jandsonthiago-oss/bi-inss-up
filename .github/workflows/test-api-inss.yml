@@ -1,0 +1,21 @@
+name: Testar API INSS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  testar-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Baixar codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Testar conexao com API oficial do INSS
+        run: python main.py
