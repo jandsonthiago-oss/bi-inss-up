@@ -1,0 +1,51 @@
+name: Testar SharePoint
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+
+jobs:
+  testar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Login Microsoft Entra via OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Testar upload SharePoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SITE_ID="universoprevidenciario.sharepoint.com,b4ca13e8-7517-4e58-bb82-4cb8f8e06866,c2bf221a-26c3-4ff9-8dd3-648cb5cc1552"
+
+          TOKEN="$(az account get-access-token \
+            --resource-type ms-graph \
+            --query accessToken \
+            --output tsv)"
+
+          echo "GitHub -> Entra -> SharePoint OK" > teste-conexao.txt
+
+          HTTP="$(curl -sS \
+            -o resposta.json \
+            -w "%{http_code}" \
+            -X PUT \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @teste-conexao.txt \
+            "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/teste-conexao.txt:/content")"
+
+          cat resposta.json
+
+          if [ "$HTTP" != "200" ] && [ "$HTTP" != "201" ]; then
+            echo "ERRO HTTP $HTTP"
+            exit 1
+          fi
+
+          echo "UPLOAD SHAREPOINT OK"
