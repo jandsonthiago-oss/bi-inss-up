@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import hashlib
 import json
 import os
@@ -29,6 +30,8 @@ from urllib3.util.retry import Retry
 # BI INSS - UNIVERSO PREVIDENCIARIO
 # INSS 2025+ -> Parquet -> SharePoint -> Power BI
 # ============================================================
+
+APP_VERSION = "5.1.0"
 
 CKAN_BASE = "https://dadosabertos.inss.gov.br"
 CKAN_ORG = "instituto-nacional-de-seguro-social-inss"
@@ -115,7 +118,7 @@ def build_session() -> requests.Session:
     )
     s = requests.Session()
     s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.headers.update({"User-Agent": "UniversoPrevidenciario-BI-INSS/3.0"})
+    s.headers.update({"User-Agent": "UniversoPrevidenciario-BI-INSS/5.1.0"})
     return s
 
 
@@ -430,9 +433,15 @@ class Graph:
                 start = end + 1
 
 
-def detect_csv(path: Path) -> tuple[str, str]:
+def detect_csv(path: Path) -> tuple[str, str, int]:
+    """Detecta encoding, delimitador e linha real do cabecalho.
+
+    Alguns arquivos oficiais trazem linhas informativas antes da tabela.
+    A deteccao usa consistencia de quantidade de campos para evitar que
+    pandas interprete essas linhas como cabecalho.
+    """
     with path.open("rb") as f:
-        sample = f.read(250_000)
+        sample = f.read(512_000)
 
     encoding = "utf-8"
     for enc in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
@@ -444,13 +453,65 @@ def detect_csv(path: Path) -> tuple[str, str]:
             pass
 
     text = sample.decode(encoding)
-    try:
-        delimiter = csv.Sniffer().sniff(text[:100_000], delimiters=",;\t|").delimiter
-    except csv.Error:
-        delimiter = ";" if text.count(";") > text.count(",") else ","
+    lines = text.splitlines()
 
-    return encoding, delimiter
+    # CSVs gerados para Excel podem trazer "sep=;" na primeira linha.
+    for idx, line in enumerate(lines[:10]):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = re.fullmatch(r"sep=(.)", stripped, flags=re.I)
+        if m:
+            return encoding, m.group(1), idx + 1
+        break
 
+    def width(line: str, delimiter: str) -> int:
+        try:
+            return len(next(csv.reader([line], delimiter=delimiter, quotechar='"')))
+        except (csv.Error, StopIteration):
+            return 0
+
+    candidates = [";", ",", "\t", "|", "^"]
+    useful = [
+        line for line in lines[:100]
+        if line.strip() and not line.lstrip().startswith(("#", "//"))
+    ]
+
+    best = None
+    for delimiter in candidates:
+        widths = [width(line, delimiter) for line in useful[:60]]
+        widths = [w for w in widths if w > 1]
+        if not widths:
+            continue
+        counts = {}
+        for w in widths:
+            counts[w] = counts.get(w, 0) + 1
+        mode_width, mode_count = max(counts.items(), key=lambda x: (x[1], x[0]))
+        consistency = mode_count / len(widths)
+        score = (consistency, mode_width, mode_count)
+        if best is None or score > best[0]:
+            best = (score, delimiter, mode_width)
+
+    if best is None:
+        raise RuntimeError(f"Nao foi possivel detectar delimitador: {path.name}")
+
+    _, delimiter, dominant_width = best
+    header_index = 0
+    for i, line in enumerate(lines[:40]):
+        if not line.strip():
+            continue
+        if width(line, delimiter) != dominant_width:
+            continue
+        try:
+            fields = next(csv.reader([line], delimiter=delimiter, quotechar='"'))
+        except csv.Error:
+            continue
+        nonempty = sum(bool(str(v).strip()) for v in fields)
+        if nonempty >= max(2, dominant_width // 2):
+            header_index = i
+            break
+
+    return encoding, delimiter, header_index
 
 def unique_columns(columns: list[Any]) -> list[str]:
     used: dict[str, int] = {}
@@ -478,7 +539,7 @@ def chunk_to_table(df: pd.DataFrame) -> pa.Table:
 
 
 def csv_to_parquet(source: Path, target: Path) -> int:
-    encoding, delimiter = detect_csv(source)
+    encoding, delimiter, header_index = detect_csv(source)
     writer: pq.ParquetWriter | None = None
     rows = 0
 
@@ -487,6 +548,8 @@ def csv_to_parquet(source: Path, target: Path) -> int:
             source,
             sep=delimiter,
             encoding=encoding,
+            skiprows=header_index,
+            engine="python",
             dtype=str,
             chunksize=CSV_CHUNK_ROWS,
             keep_default_na=False,
@@ -604,33 +667,77 @@ def xls_to_parquet(source: Path, output_dir: Path, prefix: str) -> list[tuple[Pa
         raise RuntimeError(f"XLS sem dados tabulares: {source.name}")
     return outputs
 
-def extension_of(resource: dict[str, Any]) -> str:
-    fmt = norm(resource.get("format")).replace(".", "")
-    if fmt in {"csv", "xlsx", "xls", "zip", "txt"}:
-        return f".{fmt}"
+def detect_file_kind(path: Path) -> str:
+    """Detecta o formato REAL pelo conteudo, nao pela etiqueta do CKAN."""
+    with path.open("rb") as f:
+        head = f.read(16)
 
-    ext = Path(urlparse(str(resource.get("url") or "")).path).suffix.lower()
-    return ext if ext in {".csv", ".xlsx", ".xls", ".zip", ".txt"} else ".bin"
+    if head.startswith(b"\x1f\x8b"):
+        return "gzip"
+
+    if zipfile.is_zipfile(path):
+        # XLSX tambem e um ZIP, por isso diferenciamos pelo conteudo interno.
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = {n.replace("\\", "/") for n in z.namelist()}
+                if "[Content_Types].xml" in names and any(n.startswith("xl/") for n in names):
+                    return "xlsx"
+        except zipfile.BadZipFile:
+            pass
+        return "zip"
+
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "xls"
+
+    stripped = head.lstrip().lower()
+    if stripped.startswith(b"<html") or stripped.startswith(b"<!doctype"):
+        return "html"
+
+    return "csv"
 
 
-def download_resource(resource: dict[str, Any], folder: Path) -> tuple[Path, str]:
+def download_resource(resource: dict[str, Any], folder: Path) -> tuple[Path, str, str]:
     url = str(resource.get("url") or "")
     if not url:
         raise RuntimeError("Recurso sem URL.")
 
-    target = folder / f"origem{extension_of(resource)}"
+    raw = folder / "origem.bin"
     digest = hashlib.sha256()
 
-    with HTTP.get(url, stream=True, timeout=(30, 300)) as r:
+    with HTTP.get(
+        url,
+        stream=True,
+        headers={"Referer": f"{CKAN_BASE}/", "Accept": "*/*"},
+        timeout=(30, 600),
+        allow_redirects=True,
+    ) as r:
         r.raise_for_status()
-        with target.open("wb") as f:
+        content_type = str(r.headers.get("Content-Type") or "")
+        with raw.open("wb") as f:
             for chunk in r.iter_content(DOWNLOAD_CHUNK):
                 if chunk:
                     f.write(chunk)
                     digest.update(chunk)
 
-    return target, digest.hexdigest()
+    if raw.stat().st_size == 0:
+        raise RuntimeError("Download resultou em arquivo vazio.")
 
+    kind = detect_file_kind(raw)
+    if kind == "html":
+        raise RuntimeError(
+            f"Portal devolveu HTML em vez da base. Content-Type={content_type!r}"
+        )
+
+    suffix = {
+        "zip": ".zip",
+        "gzip": ".gz",
+        "xlsx": ".xlsx",
+        "xls": ".xls",
+        "csv": ".csv",
+    }[kind]
+    target = folder / f"origem{suffix}"
+    raw.replace(target)
+    return target, digest.hexdigest(), kind
 
 def convert_resource(
     source: Path,
@@ -641,68 +748,107 @@ def convert_resource(
     out.mkdir(exist_ok=True)
 
     prefix = f"{safe_name(resource.get('id'), 50)}__{safe_name(resource.get('name'), 80)}"
+    kind = detect_file_kind(source)
 
-    if source.suffix.lower() in {".csv", ".txt"}:
+    if kind == "csv":
         target = out / f"{prefix}.parquet"
         return [(target, csv_to_parquet(source, target))]
 
-    if source.suffix.lower() == ".xlsx":
+    if kind == "xlsx":
         return xlsx_to_parquet(source, out, prefix)
 
-    if source.suffix.lower() == ".xls":
+    if kind == "xls":
         return xls_to_parquet(source, out, prefix)
 
-    if source.suffix.lower() != ".zip":
-        raise RuntimeError(f"Formato nao suportado: {source.suffix}")
+    if kind == "gzip":
+        extracted = folder / "gzip_extraido.bin"
+        with gzip.open(source, "rb") as src_gz, extracted.open("wb") as dst:
+            shutil.copyfileobj(src_gz, dst, length=DOWNLOAD_CHUNK)
+        inner_kind = detect_file_kind(extracted)
+        suffix = {
+            "zip": ".zip",
+            "xlsx": ".xlsx",
+            "xls": ".xls",
+            "csv": ".csv",
+        }.get(inner_kind)
+        if not suffix:
+            raise RuntimeError(f"GZIP contem formato nao suportado: {inner_kind}")
+        renamed = folder / f"gzip_extraido{suffix}"
+        extracted.replace(renamed)
+        return convert_resource(renamed, resource, folder)
+
+    if kind != "zip":
+        raise RuntimeError(f"Formato real nao suportado: {kind}")
 
     with zipfile.ZipFile(source) as z:
-        members = [n for n in z.namelist() if not n.endswith("/") and "__MACOSX" not in n]
+        members = []
+        for n in z.namelist():
+            if n.endswith("/") or "__MACOSX" in n:
+                continue
+            parts = Path(n.replace("\\", "/")).parts
+            if ".." in parts:
+                raise RuntimeError(f"ZIP com caminho inseguro: {n}")
+            members.append(n)
 
         csvs = [n for n in members if Path(n).suffix.lower() in {".csv", ".txt"}]
         excels = [n for n in members if Path(n).suffix.lower() in {".xlsx", ".xls"}]
 
-        # Quando o ZIP traz CSV + JSON espelho, usamos CSV para evitar duplicidade.
+        # Se o ZIP trouxer CSV + JSON espelho, usamos somente o tabular.
         chosen = csvs or excels
         if not chosen:
-            raise RuntimeError("ZIP sem CSV/TXT/XLSX tabular.")
+            raise RuntimeError("ZIP sem CSV/TXT/XLSX/XLS tabular.")
 
         outputs: list[tuple[Path, int]] = []
 
         for i, member in enumerate(chosen, start=1):
-            ext = Path(member).suffix.lower()
-            extracted = folder / f"zip_{i}{ext}"
+            declared_ext = Path(member).suffix.lower()
+            extracted_raw = folder / f"zip_{i}.bin"
+            with z.open(member) as src_zip, extracted_raw.open("wb") as dst:
+                shutil.copyfileobj(src_zip, dst, length=DOWNLOAD_CHUNK)
 
-            with z.open(member) as src, extracted.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=DOWNLOAD_CHUNK)
+            inner_kind = detect_file_kind(extracted_raw)
+            actual_ext = {
+                "csv": ".csv",
+                "xlsx": ".xlsx",
+                "xls": ".xls",
+                "zip": ".zip",
+            }.get(inner_kind, declared_ext)
+            extracted = folder / f"zip_{i}{actual_ext}"
+            extracted_raw.replace(extracted)
 
             inner_prefix = f"{prefix}__{safe_name(Path(member).stem)}"
 
-            if ext in {".csv", ".txt"}:
+            if inner_kind == "csv":
                 target = out / f"{inner_prefix}.parquet"
                 outputs.append((target, csv_to_parquet(extracted, target)))
-            elif ext == ".xlsx":
+            elif inner_kind == "xlsx":
                 outputs.extend(xlsx_to_parquet(extracted, out, inner_prefix))
-            else:
+            elif inner_kind == "xls":
                 outputs.extend(xls_to_parquet(extracted, out, inner_prefix))
+            elif inner_kind == "zip":
+                nested_resource = dict(resource)
+                nested_resource["name"] = f"{resource.get('name')} - {Path(member).stem}"
+                outputs.extend(convert_resource(extracted, nested_resource, folder))
+            else:
+                raise RuntimeError(f"Formato interno nao suportado: {inner_kind}")
 
             extracted.unlink(missing_ok=True)
 
         return outputs
-
 
 def control_path(category: str) -> str:
     return f"{BASE_FOLDER}/_controle/{category}.json"
 
 
 def load_control(graph: Graph, category: str) -> dict[str, Any]:
-    try:
-        control = graph.read_json(control_path(category))
-    except Exception:
+    control = graph.read_json(control_path(category))
+    if not control:
         control = {}
-
     if not isinstance(control, dict):
-        control = {}
-    control.setdefault("resources", {})
+        raise RuntimeError(f"Controle invalido para {category}")
+    resources = control.setdefault("resources", {})
+    if not isinstance(resources, dict):
+        raise RuntimeError(f"Controle.resources invalido para {category}")
     return control
 
 
@@ -747,8 +893,10 @@ def process_one(
         folder = Path(tmp)
 
         print("1/4 Download oficial...")
-        source, sha = download_resource(resource, folder)
+        source, sha, detected_kind = download_resource(resource, folder)
         print(f"OK | {source.stat().st_size / 1024 / 1024:,.1f} MB")
+        print(f"Formato declarado: {resource.get('format')} | mimetype={resource.get('mimetype')}")
+        print(f"Formato REAL detectado: {detected_kind.upper()}")
 
         print("2/4 Conversao Parquet em lotes...")
         outputs = convert_resource(source, resource, folder)
@@ -773,6 +921,9 @@ def process_one(
             "resource_name": name,
             "resource_url": resource.get("url"),
             "resource_format": resource.get("format"),
+            "resource_mimetype": resource.get("mimetype"),
+            "detected_kind": detected_kind,
+            "app_version": APP_VERSION,
             "version": resource_version(resource),
             "source_sha256": sha,
             "years": years_of(resource),
@@ -804,6 +955,7 @@ def main() -> int:
 
     print("=" * 80)
     print("UNIVERSO PREVIDENCIARIO - BI INSS CLOUD")
+    print(f"APP_VERSION: {APP_VERSION}")
     print(f"Periodo: {ANO_INICIAL} em diante")
     print("Processamento: um recurso por vez")
     print("=" * 80)
@@ -860,7 +1012,7 @@ def main() -> int:
 
     # Erros parciais nao apagam nem invalidam o que ja foi concluido.
     # A proxima execucao retenta somente os recursos ainda nao checkpointados.
-    return 0
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
