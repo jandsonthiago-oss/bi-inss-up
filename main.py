@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -13,33 +12,21 @@ BASE_URL = "https://dadosabertos.inss.gov.br"
 ORGANIZACAO = "instituto-nacional-de-seguro-social-inss"
 ANO_INICIAL = 2025
 
-# Lista controlada das bases que interessam ao BI.
-# Não usamos filtro genérico como "emitidos" ou "requerimentos",
-# para evitar capturar datasets errados.
-BASES_ALVO = (
-    "beneficios concedidos",
-    "beneficios indeferidos",
-    "dados de requerimentos administrativos solicitados",
-    "dados quantitativos de requerimentos administrativos solicitados",
-    "dados de requerimentos administrativos pendentes",
-    "dados quantitativos de requerimentos administrativos pendentes",
-    "beneficios emitidos",
-    "beneficios mantidos",
-    "comunicacoes de acidente de trabalho",
-    "perfil das unidades",
-    "dados agregados da folha de pagamento em relacao aos beneficios emitidos",
-)
+# SOMENTE os datasets oficiais atuais que interessam ao BI.
+# Filtro exato pelo slug CKAN: elimina series legadas e coincidencias por nome.
+DATASETS_ALVO = {
+    "beneficios-concedidos-plano-de-dados-abertos-jun-2023-a-jun-2025",
+    "beneficios-indeferidos-plano-de-dados-abertos-jun-2023-a-jun-2025",
+    "beneficios-emitidos-plano-de-dados-abertos-jun-2023-a-jun-2025",
+    "beneficios-mantidos-plano-de-dados-abertos-jun-2023-a-jun-2025",
+    "comunicacoes-de-acidente-de-trabalho-cat-plano-de-dados-abertos-jun-2023-a-jun-2025",
+    "perfil-das-unidades-plano-de-dados-abertos-jun-2023-a-jun-2025",
+    "dados-de-requerimentos-administrativos-solicitados-plano-de-dados-abertos-jun-2023-a-jun-2025",
+    "dados-de-requerimentos-administrativos-pendentes-plano-de-dados-abertos-jun-2023-a-jun-2025",
+    "dados-agregados-da-folha-de-pagamento-beneficios-emitidos-plano-de-dados-abertos-jun-2023-a-jun-2027",
+}
 
 ARQUIVO_SAIDA = Path("catalogo_inss_2025.json")
-
-
-def normalizar(texto: object) -> str:
-    texto = "" if texto is None else str(texto)
-    texto = unicodedata.normalize("NFKD", texto)
-    texto = texto.encode("ascii", "ignore").decode("ascii")
-    texto = texto.lower().strip()
-    texto = re.sub(r"\s+", " ", texto)
-    return texto
 
 
 def api_get(acao: str, parametros: dict) -> dict:
@@ -49,7 +36,7 @@ def api_get(acao: str, parametros: dict) -> dict:
     req = Request(
         url,
         headers={
-            "User-Agent": "UniversoPrevidenciario-BI-INSS/1.0",
+            "User-Agent": "UniversoPrevidenciario-BI-INSS/2.0",
             "Accept": "application/json",
         },
     )
@@ -63,24 +50,15 @@ def api_get(acao: str, parametros: dict) -> dict:
     return payload["result"]
 
 
-def eh_base_alvo(titulo: str) -> bool:
-    titulo_n = normalizar(titulo)
-    return any(base in titulo_n for base in BASES_ALVO)
-
-
 def anos_do_recurso(nome: str) -> list[int]:
-    # IMPORTANTE:
-    # O ano é lido do NOME DO RECURSO, e não do título do dataset.
-    # Isso evita interpretar "PDA Jun/2023 a Jun/2027"
-    # como se o arquivo fosse de 2027.
     return [int(a) for a in re.findall(r"\b(20\d{2})\b", nome or "")]
 
 
 def recurso_desde_2025(nome: str) -> bool:
     anos = anos_do_recurso(nome)
 
-    # Recursos sem ano explícito podem ser dicionários,
-    # cadastros ou arquivos de referência e são preservados.
+    # Sem ano explicito = dicionario/referencia.
+    # Preservamos porque pode ser necessario para interpretar os dados.
     if not anos:
         return True
 
@@ -88,11 +66,11 @@ def recurso_desde_2025(nome: str) -> bool:
 
 
 def main() -> None:
-    print("=" * 70)
-    print("UNIVERSO PREVIDENCIARIO - API INSS")
-    print(f"Janela oficial do projeto: {ANO_INICIAL} em diante")
-    print("Modo: SOMENTE CATALOGO - nenhum arquivo pesado sera baixado")
-    print("=" * 70)
+    print("=" * 72)
+    print("UNIVERSO PREVIDENCIARIO - CATALOGO OFICIAL INSS")
+    print(f"Periodo de producao: {ANO_INICIAL} em diante")
+    print("Modo seguro: nenhum CSV/XLSX/ZIP pesado sera baixado")
+    print("=" * 72)
 
     resultado = api_get(
         "package_search",
@@ -104,14 +82,20 @@ def main() -> None:
     )
 
     datasets_api = resultado.get("results", [])
+
+    encontrados_slugs = set()
     selecionados = []
+    resource_ids_vistos = set()
 
     for dataset in datasets_api:
-        titulo = dataset.get("title") or dataset.get("name") or ""
+        slug = (dataset.get("name") or "").strip()
 
-        if not eh_base_alvo(titulo):
+        if slug not in DATASETS_ALVO:
             continue
 
+        encontrados_slugs.add(slug)
+
+        titulo = dataset.get("title") or slug
         recursos_validos = []
 
         for recurso in dataset.get("resources") or []:
@@ -120,9 +104,19 @@ def main() -> None:
             if not recurso_desde_2025(nome):
                 continue
 
+            resource_id = recurso.get("id")
+
+            # Protecao contra o mesmo resource_id aparecer duas vezes.
+            if resource_id in resource_ids_vistos:
+                raise RuntimeError(
+                    f"RESOURCE_ID DUPLICADO DETECTADO: {resource_id}"
+                )
+
+            resource_ids_vistos.add(resource_id)
+
             recursos_validos.append(
                 {
-                    "resource_id": recurso.get("id"),
+                    "resource_id": resource_id,
                     "nome": nome,
                     "formato": recurso.get("format"),
                     "url": recurso.get("url"),
@@ -135,23 +129,36 @@ def main() -> None:
                 }
             )
 
-        if recursos_validos:
-            selecionados.append(
-                {
-                    "dataset_id": dataset.get("id"),
-                    "dataset_slug": dataset.get("name"),
-                    "dataset_titulo": titulo,
-                    "metadata_modified": dataset.get("metadata_modified"),
-                    "quantidade_recursos": len(recursos_validos),
-                    "recursos": recursos_validos,
-                }
-            )
+        selecionados.append(
+            {
+                "dataset_id": dataset.get("id"),
+                "dataset_slug": slug,
+                "dataset_titulo": titulo,
+                "metadata_modified": dataset.get("metadata_modified"),
+                "quantidade_recursos": len(recursos_validos),
+                "recursos": recursos_validos,
+            }
+        )
+
+    # Se o INSS mudar/remover um dataset, o processo PARA.
+    # Nao seguimos silenciosamente com uma base incompleta.
+    faltantes = DATASETS_ALVO - encontrados_slugs
+
+    if faltantes:
+        print("\nERRO: datasets oficiais esperados nao encontrados:")
+        for slug in sorted(faltantes):
+            print(f"  - {slug}")
+
+        raise RuntimeError(
+            "Catalogo incompleto. Nenhum processamento deve continuar."
+        )
 
     catalogo = {
         "gerado_em_utc": datetime.now(timezone.utc).isoformat(),
         "fonte": BASE_URL,
         "ano_inicial": ANO_INICIAL,
         "datasets_encontrados_no_portal": len(datasets_api),
+        "datasets_esperados": len(DATASETS_ALVO),
         "datasets_selecionados": len(selecionados),
         "datasets": selecionados,
     }
@@ -163,23 +170,32 @@ def main() -> None:
 
     print()
     print(f"Datasets encontrados no portal: {len(datasets_api)}")
-    print(f"Datasets selecionados para o BI: {len(selecionados)}")
+    print(f"Datasets oficiais esperados: {len(DATASETS_ALVO)}")
+    print(f"Datasets selecionados: {len(selecionados)}")
     print()
 
     total_recursos = 0
 
-    for dataset in selecionados:
+    for dataset in sorted(
+        selecionados,
+        key=lambda d: d["dataset_titulo"].lower()
+    ):
         qtd = dataset["quantidade_recursos"]
         total_recursos += qtd
+
         print(f"[OK] {dataset['dataset_titulo']}")
-        print(f"     Recursos de 2025 em diante/referencia: {qtd}")
+        print(f"     Slug: {dataset['dataset_slug']}")
+        print(f"     Dataset ID CKAN: {dataset['dataset_id']}")
+        print(f"     Recursos 2025+/referencia: {qtd}")
 
     print()
+    print("=" * 72)
+    print(f"DATASETS VALIDOS: {len(selecionados)}/9")
     print(f"TOTAL DE RECURSOS CONTROLADOS: {total_recursos}")
     print(f"Catalogo salvo em: {ARQUIVO_SAIDA}")
-    print()
-    print("TESTE CONCLUIDO.")
-    print("Nenhum CSV, XLSX ou ZIP do INSS foi baixado nesta etapa.")
+    print("VALIDACAO CONCLUIDA COM SUCESSO.")
+    print("Nenhum arquivo pesado do INSS foi baixado.")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
