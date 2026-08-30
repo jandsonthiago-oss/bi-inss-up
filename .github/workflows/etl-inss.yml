@@ -1,0 +1,74 @@
+name: ETL INSS 2025+
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_resources:
+        description: "Recursos por base nesta execucao"
+        required: false
+        default: "1"
+
+  schedule:
+    - cron: "17 7 * * *"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: bi-inss-etl-producao
+  cancel-in-progress: false
+
+jobs:
+  etl:
+    name: ${{ matrix.dataset }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        dataset:
+          - concedidos
+          - emitidos
+          - indeferidos
+          - mantidos
+          - cat
+          - solicitados
+          - pendentes
+          - unidades
+          - folha_emitidos
+
+    steps:
+      - name: Baixar codigo
+        uses: actions/checkout@v7
+
+      - name: Configurar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Login Microsoft Entra via OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Executar ETL INSS
+        env:
+          ANO_INICIAL: "2025"
+          SHAREPOINT_SITE_ID: "universoprevidenciario.sharepoint.com,b4ca13e8-7517-4e58-bb82-4cb8f8e06866,c2bf221a-26c3-4ff9-8dd3-648cb5cc1552"
+          SHAREPOINT_BASE_FOLDER: "INSS"
+          MAX_RESOURCES: ${{ github.event.inputs.max_resources || '1' }}
+        run: |
+          python main.py \
+            --dataset "${{ matrix.dataset }}" \
+            --max-resources "$MAX_RESOURCES"
